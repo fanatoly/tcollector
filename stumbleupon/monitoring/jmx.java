@@ -52,6 +52,7 @@ import sun.jvmstat.monitor.MonitoredVm;
 import sun.jvmstat.monitor.MonitoredVmUtil;
 import sun.jvmstat.monitor.VmIdentifier;
 
+import javax.management.openmbean.*;
 final class jmx {
 
   private static final String LOCAL_CONNECTOR_ADDRESS =
@@ -229,13 +230,24 @@ final class jmx {
                                      final ObjectName object,
                                      final String name,
                                      final Object value) {
+    if(value instanceof CompositeDataSupport){
+      CompositeDataSupport multiValMBean = (CompositeDataSupport) value;
+      CompositeType multiValType = multiValMBean.getCompositeType();
+      for(String subKey : multiValType.keySet()){
+          dumpMBeanValue(long_output, print_timestamps, object, name+"."+subKey, multiValMBean.get(subKey));
+      }
+      return;
+    }
+
     final StringBuilder buf = new StringBuilder();
     final long timestamp = System.currentTimeMillis() / 1000;
     if (print_timestamps) {
       buf.append(timestamp).append('\t');
     }
     if (value instanceof Object[]) {
-      for (final Object o : (Object[]) value) {
+      Object[] values = (Object[]) value;
+      if(values.length <= 0) return;
+      for (final Object o : values) {
         buf.append(o).append('\t');
       }
       buf.setLength(buf.length() - 1);
