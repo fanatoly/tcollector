@@ -23,11 +23,11 @@ import traceback
 
 # If this user doesn't exist, we'll exit immediately.
 # If we're running as root, we'll drop privileges using this user.
-USER = "tsuna"
+USER = "hbase"
 
 # We add those files to the classpath if they exist.
 CLASSPATH = [
-    "/usr/lib/jvm/java-1.6.0-openjdk-1.6.0.0.x86_64/lib/tools.jar",
+    "/usr/lib/jvm/jdk1.7.0/lib/tools.jar",
 ]
 
 # We shorten certain strings to avoid excessively long metric names.
@@ -35,6 +35,7 @@ JMX_SERVICE_RENAMING = {
     "GarbageCollector": "gc",
     "OperatingSystem": "os",
     "Threading": "threads",
+    "Memory": "mem",
     # New in 0.92.1, from HBASE-5325:
     "org.apache.hbase": "hbase",
 }
@@ -96,14 +97,14 @@ def main(argv):
          "-Xmx64m",  # Low RAM limit, to avoid stealing too much from prod.
          "-cp", classpath, "com.stumbleupon.monitoring.jmx",
          "--watch", "10", "--long", "--timestamp",
-         "HMaster",  # Name of the process.
+         "HRegionServer",  # Name of the process.
          # The remaining arguments are pairs (mbean_regexp, attr_regexp).
          # The first regexp is used to match one or more MBeans, the 2nd
          # to match one or more attributes of the MBeans matched.
          "hadoop", "",                     # All HBase / hadoop metrics.
          "Threading", "Count|Time$",       # Number of threads and CPU time.
          "OperatingSystem", "OpenFile",    # Number of open files.
-         "GarbageCollector", "Collection", # GC runs and time spent GCing.
+         "java.lang:type=Memory$", "Usage$", # GC runs and time spent GCing.
          ], stdout=subprocess.PIPE, bufsize=1)
     do_on_signal(signal.SIGINT, kill, jmx)
     do_on_signal(signal.SIGPIPE, kill, jmx)
