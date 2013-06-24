@@ -105,6 +105,7 @@ def main(argv):
          "Threading", "Count|Time$",       # Number of threads and CPU time.
          "OperatingSystem", "OpenFile",    # Number of open files.
          "java.lang:type=Memory$", "Usage$", # GC runs and time spent GCing.
+         "GarbageCollector", "Collection", # GC runs and time spent GCing.
          ], stdout=subprocess.PIPE, bufsize=1)
     do_on_signal(signal.SIGINT, kill, jmx)
     do_on_signal(signal.SIGPIPE, kill, jmx)
