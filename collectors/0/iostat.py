@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # This file is part of tcollector.
-# Copyright (C) 2010  StumbleUpon, Inc.
+# Copyright (C) 2010  The tcollector Authors.
 #
 # This program is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Lesser General Public License as published by
@@ -68,10 +68,10 @@
 # %util.  These need to pull in cpu idle counters from /proc.
 
 
-import os
-import socket
 import sys
 import time
+
+from collectors.lib import utils
 
 COLLECTION_INTERVAL = 60  # seconds
 
@@ -100,6 +100,7 @@ FIELDS_PART = ("read_issued",
 def main():
     """iostats main loop."""
     f_diskstats = open("/proc/diskstats", "r")
+    utils.drop_privileges()
 
     while True:
         f_diskstats.seek(0)
@@ -120,9 +121,7 @@ def main():
             else:
                 metric = "iostat.part."
 
-            # Sometimes there can be a slash in the device name, see bug #8.
-            # TODO(tsuna): Remove the substitution once TSD allows `/' in tags.
-            device = values[2].replace("/", "_")
+            device = values[2]
             if len(values) == 14:
                 # full stats line
                 for i in range(11):

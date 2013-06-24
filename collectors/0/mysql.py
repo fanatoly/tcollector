@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # This file is part of tcollector.
-# Copyright (C) 2011  StumbleUpon, Inc.
+# Copyright (C) 2011  The tcollector Authors.
 #
 # This program is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Lesser General Public License as published by
@@ -17,7 +17,6 @@ import errno
 import os
 import re
 import socket
-import stat
 import sys
 import time
 
@@ -26,10 +25,8 @@ try:
 except ImportError:
   MySQLdb = None  # This is handled gracefully in main()
 
-# This is really ugly, but we don't have a good way of passing
-# configuration data down to the collectors at the moment :(
-sys.path.append(os.path.dirname(sys.argv[0]) + "/../etc")
-import mysqlconf
+from collectors.etc import mysqlconf
+from collectors.lib import utils
 
 COLLECTION_INTERVAL = 15  # seconds
 CONNECT_TIMEOUT = 2  # seconds
@@ -150,18 +147,6 @@ def get_dbname(sockfile):
   return m.group(1)
 
 
-def is_sockfile(path):
-  """Returns whether or not the given path is a socket file."""
-  try:
-    s = os.stat(path)
-  except OSError, (no, e):
-    if no == errno.ENOENT:
-      return False
-    err("warning: couldn't stat(%r): %s" % (path, e))
-    return None
-  return s.st_mode & stat.S_IFSOCK == stat.S_IFSOCK
-
-
 def find_sockfiles():
   """Returns a list of paths to socket files to monitor."""
   paths = []
@@ -175,12 +160,12 @@ def find_sockfiles():
         continue
       for subname in os.listdir(subdir):
         path = os.path.join(subdir, subname)
-        if is_sockfile(path):
+        if utils.is_sockfile(path):
           paths.append(path)
           break  # We only expect 1 socket file per DB, so get out.
   # Try the default locations.
   for sockfile in DEFAULT_SOCKFILES:
-    if not is_sockfile(sockfile):
+    if not utils.is_sockfile(sockfile):
       continue
     paths.append(sockfile)
   return paths

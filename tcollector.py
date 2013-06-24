@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # This file is part of tcollector.
-# Copyright (C) 2010  StumbleUpon, Inc.
+# Copyright (C) 2010  The tcollector Authors.
 #
 # This program is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Lesser General Public License as published by
@@ -50,6 +50,8 @@ ALIVE = True
 # exceptions, something is not right and tcollector will shutdown.
 # Hopefully some kind of supervising daemon will then restart it.
 MAX_UNCAUGHT_EXCEPTIONS = 100
+DEFAULT_PORT = 4242
+MAX_REASONABLE_TIMESTAMP = 1600000000  # Good until September 2020 :)
 
 def register_collector(collector):
     """Register a collector with the COLLECTORS global"""
@@ -191,8 +193,8 @@ class Collector(object):
                 for attempt in range(5):
                     if self.proc.poll() is not None:
                         return
-                    LOG.info('Waiting %ds for PID %d to exit...'
-                             % (5 - attempt, self.proc.pid))
+                    LOG.info('Waiting %ds for PID %d (%s) to exit...'
+                             % (5 - attempt, self.proc.pid, self.name))
                     time.sleep(1)
                 kill(self.proc, signal.SIGKILL)
                 self.proc.wait()
@@ -341,6 +343,12 @@ class ReaderThread(threading.Thread):
                           col.values[key][3], timestamp, value, col.name)
                 col.lines_invalid += 1
                 return
+            elif timestamp >= MAX_REASONABLE_TIMESTAMP:
+                LOG.error("Timestamp is too far out in the future: metric=%s%s"
+                          " old_ts=%d, new_ts=%d - ignoring data point"
+                          " (value=%r, collector=%s)", metric, tags,
+                          col.values[key][3], timestamp, value, col.name)
+                return
 
             # if this data point is repeated, store it but don't send.
             # store the previous timestamp, so when/if this value changes
@@ -383,15 +391,14 @@ class SenderThread(threading.Thread):
        buffering we might need to do if we can't establish a connection
        and we need to spool to disk.  That isn't implemented yet."""
 
-    def __init__(self, reader, dryrun, host, port, self_report_stats, tags):
+    def __init__(self, reader, dryrun, hosts, self_report_stats, tags):
         """Constructor.
 
         Args:
           reader: A reference to a ReaderThread instance.
           dryrun: If true, data points will be printed on stdout instead of
             being sent to the TSD.
-          host: The hostname of the TSD to connect to.
-          port: The port of the TSD to connect to.
+          hosts: List of (host, port) tuples defining list of TSDs
           self_report_stats: If true, the reader thread will insert its own
             stats into the metrics reported to TSD, as if those metrics had
             been read from a collector.
@@ -400,14 +407,48 @@ class SenderThread(threading.Thread):
         super(SenderThread, self).__init__()
 
         self.dryrun = dryrun
-        self.host = host
-        self.port = port
         self.reader = reader
         self.tagstr = tags
-        self.tsd = None
+        self.hosts = hosts  # A list of (host, port) pairs.
+        # Randomize hosts to help even out the load.
+        random.shuffle(self.hosts)
+        self.blacklisted_hosts = set()  # The 'bad' (host, port) pairs.
+        self.current_tsd = -1  # Index in self.hosts where we're at.
+        self.host = None  # The current TSD host we've selected.
+        self.port = None  # The port of the current TSD.
+        self.tsd = None   # The socket connected to the aforementioned TSD.
         self.last_verify = 0
         self.sendq = []
         self.self_report_stats = self_report_stats
+
+    def pick_connection(self):
+        """Picks up a random host/port connection."""
+        # Try to get the next host from the list, until we find a host that
+        # isn't in the blacklist, or until we run out of hosts (i.e. they
+        # are all blacklisted, which typically happens when we lost our
+        # connectivity to the outside world).
+        for self.current_tsd in xrange(self.current_tsd + 1, len(self.hosts)):
+            hostport = self.hosts[self.current_tsd]
+            if hostport not in self.blacklisted_hosts:
+                break
+        else:
+            LOG.info('No more healthy hosts, retry with previously blacklisted')
+            random.shuffle(self.hosts)
+            self.blacklisted_hosts.clear()
+            self.current_tsd = 0
+            hostport = self.hosts[self.current_tsd]
+
+        self.host, self.port = hostport
+        LOG.info('Selected connection: %s:%d', self.host, self.port)
+
+    def blacklist_connection(self):
+        """Marks the current TSD host we're trying to use as blacklisted.
+
+           Blacklisted hosts will get another chance to be elected once there
+           will be no more healthy hosts."""
+        # FIXME: Enhance this naive strategy.
+        LOG.info('Blacklisting %s:%s for a while', self.host, self.port)
+        self.blacklisted_hosts.add((self.host, self.port))
 
     def run(self):
         """Main loop.  A simple scheduler.  Loop waiting for 5
@@ -452,7 +493,7 @@ class SenderThread(threading.Thread):
 
     def verify_conn(self):
         """Periodically verify that our connection to the TSD is OK
-           and that the TSD is alive/working"""
+           and that the TSD is alive/working."""
         if self.tsd is None:
             return False
 
@@ -467,6 +508,7 @@ class SenderThread(threading.Thread):
             self.tsd.sendall('version\n')
         except socket.error, msg:
             self.tsd = None
+            self.blacklist_connection()
             return False
 
         bufsize = 4096
@@ -478,12 +520,14 @@ class SenderThread(threading.Thread):
                 buf = self.tsd.recv(bufsize)
             except socket.error, msg:
                 self.tsd = None
+                self.blacklist_connection()
                 return False
 
             # If we don't get a response to the `version' request, the TSD
             # must be dead or overloaded.
             if not buf:
                 self.tsd = None
+                self.blacklist_connection()
                 return False
 
             # Woah, the TSD has a lot of things to tell us...  Let's make
@@ -547,9 +591,15 @@ class SenderThread(threading.Thread):
             time.sleep(try_delay)
 
             # Now actually try the connection.
-            adresses = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC,
-                                          socket.SOCK_STREAM, 0)
-            for family, socktype, proto, canonname, sockaddr in adresses:
+            self.pick_connection()
+            try:
+                addresses = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC,
+                                               socket.SOCK_STREAM, 0)
+            except socket.gaierror, e:
+                if e[0] in (socket.EAI_AGAIN, socket.EAI_NONAME):
+                    continue
+                raise
+            for family, socktype, proto, canonname, sockaddr in addresses:
                 try:
                     self.tsd = socket.socket(family, socktype, proto)
                     self.tsd.settimeout(15)
@@ -563,6 +613,7 @@ class SenderThread(threading.Thread):
                 self.tsd = None
             if not self.tsd:
                 LOG.error('Failed to connect to %s:%d', self.host, self.port)
+                self.blacklist_connection()
 
     def send_data(self):
         """Sends outstanding data in self.sendq to the TSD in one operation."""
@@ -593,6 +644,7 @@ class SenderThread(threading.Thread):
             except socket.error:
                 pass
             self.tsd = None
+            self.blacklist_connection()
 
         # FIXME: we should be reading the result at some point to drain
         # the packets out of the kernel's queue
@@ -634,6 +686,9 @@ def parse_cmdline(argv):
     parser.add_option('-H', '--host', dest='host', default='localhost',
                       metavar='HOST',
                       help='Hostname to use to connect to the TSD.')
+    parser.add_option('-L', '--hosts-list', dest='hosts', default=False,
+                      metavar='HOSTS',
+                      help='List of host:port to connect to tsd\'s (comma separated).')
     parser.add_option('--no-tcollector-stats', dest='no_tcollector_stats',
                       default=False, action='store_true',
                       help='Prevent tcollector from reporting its own stats to TSD')
@@ -641,7 +696,7 @@ def parse_cmdline(argv):
                       default=False,
                       help='Run once, read and dedup data points from stdin.')
     parser.add_option('-p', '--port', dest='port', type='int',
-                      default=4242, metavar='PORT',
+                      default=DEFAULT_PORT, metavar='PORT',
                       help='Port to connect to the TSD instance on. '
                            'default=%default')
     parser.add_option('-v', dest='verbose', action='store_true', default=False,
@@ -678,7 +733,7 @@ def parse_cmdline(argv):
         parser.error('--evict-interval must be strictly greater than '
                      '--dedup-interval')
     # We cannot write to stdout when we're a daemon.
-    if options.daemonize and not options.backup_count:
+    if (options.daemonize or options.max_bytes) and not options.backup_count:
         options.backup_count = 1
     return (options, args)
 
@@ -705,6 +760,20 @@ def daemonize():
             os.close(fd)
         except OSError:  # This FD wasn't opened...
             pass         # ... ignore the exception.
+
+
+def setup_python_path(argv0):
+    """Sets up PYTHONPATH so that collectors can easily import common code."""
+    mydir = os.path.abspath(os.path.dirname(argv0))
+    libdir = os.path.join(mydir, 'collectors', 'lib')
+    if not os.path.isdir(libdir):
+        return
+    pythonpath = os.environ.get('PYTHONPATH', '')
+    if pythonpath:
+        pythonpath += ':'
+    pythonpath += mydir
+    os.environ['PYTHONPATH'] = pythonpath
+    LOG.debug('Set PYTHONPATH to %r', pythonpath)
 
 
 def main(argv):
@@ -751,6 +820,8 @@ def main(argv):
         tagstr = ' '.join('%s=%s' % (k, v) for k, v in tags.iteritems())
         tagstr = ' ' + tagstr.strip()
 
+    setup_python_path(argv[0])
+
     # gracefully handle death for normal termination paths and abnormal
     atexit.register(shutdown)
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -761,8 +832,26 @@ def main(argv):
     reader = ReaderThread(options.dedupinterval, options.evictinterval)
     reader.start()
 
+    # prepare list of (host, port) of TSDs given on CLI
+    if not options.hosts:
+        options.hosts = [(options.host, options.port)]
+    else:
+        def splitHost(hostport):
+            if ":" in hostport:
+                # Check if we have an IPv6 address.
+                if hostport[0] == "[" and "]:" in hostport:
+                    host, port = hostport.split("]:")
+                    host = host[1:]
+                else:
+                    host, port = hostport.split(":")
+                return (host, int(port))
+            return (hostport, DEFAULT_PORT)
+        options.hosts = [splitHost(host) for host in options.hosts.split(",")]
+        if options.host != "localhost" or options.port != DEFAULT_PORT:
+            options.hosts.append((options.host, options.port))
+
     # and setup the sender to start writing out to the tsd
-    sender = SenderThread(reader, options.dryrun, options.host, options.port,
+    sender = SenderThread(reader, options.dryrun, options.hosts,
                           not options.no_tcollector_stats, tagstr)
     sender.start()
     LOG.info('SenderThread startup complete')
@@ -775,6 +864,10 @@ def main(argv):
     else:
         sys.stdin.close()
         main_loop(options, modules, sender, tags)
+
+    # We're exiting, make sure we don't leave any collector behind.
+    for col in all_living_collectors():
+      col.shutdown()
     LOG.debug('Shutting down -- joining the reader thread.')
     reader.join()
     LOG.debug('Shutting down -- joining the sender thread.')
@@ -956,7 +1049,7 @@ def shutdown_signal(signum, frame):
 
 
 def kill(proc, signum=signal.SIGTERM):
-  os.kill(proc.pid, signum)
+  os.killpg(proc.pid, signum)
 
 
 def shutdown():
@@ -1027,7 +1120,7 @@ def spawn_collector(col):
     #     ... load the py module directly instead of using a subprocess ...
     try:
         col.proc = subprocess.Popen(col.filename, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+                                stderr=subprocess.PIPE, preexec_fn=os.setsid)
     except OSError, e:
         LOG.error('Failed to spawn collector %s: %s' % (col.filename, e))
         return

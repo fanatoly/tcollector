@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # This file is part of tcollector.
-# Copyright (C) 2010  StumbleUpon, Inc.
+# Copyright (C) 2010  The tcollector Authors.
 #
 # This program is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Lesser General Public License as published by
@@ -15,10 +15,11 @@
 """import various /proc stats from /proc into TSDB"""
 
 import os
+import re
 import sys
 import time
-import socket
-import re
+
+from collectors.lib import utils
 
 COLLECTION_INTERVAL = 15  # seconds
 NUMADIR = "/sys/devices/system/node"
@@ -86,7 +87,9 @@ def main():
     f_stat = open("/proc/stat", "r")
     f_loadavg = open("/proc/loadavg", "r")
     f_entropy_avail = open("/proc/sys/kernel/random/entropy_avail", "r")
+    f_interrupts = open("/proc/interrupts", "r")
     numastats = open_sysfs_numa_stats()
+    utils.drop_privileges()
 
     while True:
         # proc.uptime
@@ -125,23 +128,22 @@ def main():
             m = re.match("(\w+)\s+(.*)", line)
             if not m:
                 continue
-            if m.group(1) == "cpu":
+            if m.group(1).startswith("cpu"):
+                cpu_m = re.match("cpu(\d+)", m.group(1))
+                if cpu_m:
+                    metric_percpu = '.percpu'
+                    tags = ' cpu=%s' % cpu_m.group(1)
+                else:
+                    metric_percpu = ''
+                    tags = ''
                 fields = m.group(2).split()
-                print "proc.stat.cpu %d %s type=user" % (ts, fields[0])
-                print "proc.stat.cpu %d %s type=nice" % (ts, fields[1])
-                print "proc.stat.cpu %d %s type=system" % (ts, fields[2])
-                print "proc.stat.cpu %d %s type=idle" % (ts, fields[3])
-                print "proc.stat.cpu %d %s type=iowait" % (ts, fields[4])
-                print "proc.stat.cpu %d %s type=irq" % (ts, fields[5])
-                print "proc.stat.cpu %d %s type=softirq" % (ts, fields[6])
-                # really old kernels don't have this field
-                if len(fields) > 7:
-                    print ("proc.stat.cpu %d %s type=guest"
-                           % (ts, fields[7]))
-                    # old kernels don't have this field
-                    if len(fields) > 8:
-                        print ("proc.stat.cpu %d %s type=guest_nice"
-                               % (ts, fields[8]))
+                cpu_types = ['user', 'nice', 'system', 'idle', 'iowait',
+                    'irq', 'softirq', 'guest', 'guest_nice']
+
+                # We use zip to ignore fields that don't exist.
+                for value, field_name in zip(fields, cpu_types):
+                    print "proc.stat.cpu%s %d %s type=%s%s" % (metric_percpu,
+                        ts, value, field_name, tags)
             elif m.group(1) == "intr":
                 print ("proc.stat.intr %d %s"
                         % (ts, m.group(2).split()[0]))
@@ -168,6 +170,33 @@ def main():
         ts = int(time.time())
         for line in f_entropy_avail:
             print "proc.kernel.entropy_avail %d %s" % (ts, line.strip())
+
+        f_interrupts.seek(0)
+        ts = int(time.time())
+        # Get number of CPUs from description line.
+        num_cpus = len(f_interrupts.readline().split())
+        for line in f_interrupts:
+            cols = line.split()
+
+            irq_type = cols[0].rstrip(":")
+            if irq_type.isalnum():
+                if irq_type.isdigit():
+                    if cols[-2] == "PCI-MSI-edge" and "eth" in cols[-1]:
+                        irq_type = cols[-1]
+                    else:
+                        continue  # Interrupt type is just a number, ignore.
+                for i, val in enumerate(cols[1:]):
+                    if i >= num_cpus:
+                        # All values read, remaining cols contain textual
+                        # description
+                        break
+                    if not val.isdigit():
+                        # something is weird, there should only be digit values
+                        sys.stderr.write("Unexpected interrupts value %r in"
+                                         " %r: " % (val, cols))
+                        break
+                    print ("proc.interrupts %s %s type=%s cpu=%s"
+                           % (ts, val, irq_type, i))
 
         print_numa_stats(numastats)
 
